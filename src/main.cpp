@@ -205,6 +205,76 @@ public:
         return codecContext ? codecContext->height : 0;
     }
 
+    // 将这三个方法从private移到public
+    double getDuration() const {
+        if (formatContext && videoStream) {
+            return videoStream->duration * av_q2d(videoStream->time_base);
+        }
+        return 0.0;
+    }
+
+    bool seekToTime(double timeInSeconds) {
+        if (!formatContext || videoStreamIndex == -1) {
+            return false;
+        }
+
+        int64_t targetTs = (int64_t)(timeInSeconds / av_q2d(videoStream->time_base));
+        
+        if (av_seek_frame(formatContext, videoStreamIndex, targetTs, AVSEEK_FLAG_BACKWARD) < 0) {
+            std::cerr << "跳转失败" << std::endl;
+            return false;
+        }
+        
+        avcodec_flush_buffers(codecContext);
+        
+        // 读取并解码一帧以更新当前显示
+        AVPacket packet;
+        while (av_read_frame(formatContext, &packet) >= 0) {
+            if (packet.stream_index == videoStreamIndex) {
+                int ret = avcodec_send_packet(codecContext, &packet);
+                if (ret < 0) {
+                    av_packet_unref(&packet);
+                    continue;
+                }
+
+                ret = avcodec_receive_frame(codecContext, frame);
+                if (ret < 0) {
+                    av_packet_unref(&packet);
+                    continue;
+                }
+
+                // 转换帧格式
+                sws_scale(
+                    swsContext,
+                    (const uint8_t* const*)frame->data, frame->linesize,
+                    0, codecContext->height,
+                    frameRGB->data, frameRGB->linesize
+                );
+
+                // 更新纹理
+                SDL_UpdateTexture(
+                    texture,
+                    nullptr,
+                    frameRGB->data[0],
+                    frameRGB->linesize[0]
+                );
+                
+                av_packet_unref(&packet);
+                break;
+            }
+            av_packet_unref(&packet);
+        }
+        
+        return true;
+    }
+
+    double getCurrentTime() const {
+        if (formatContext && videoStream && frame && frame->pts != AV_NOPTS_VALUE) {
+            return frame->pts * av_q2d(videoStream->time_base);
+        }
+        return 0.0;
+    }
+
     void cleanup() {
         if (texture) {
             SDL_DestroyTexture(texture);
@@ -255,13 +325,15 @@ private:
     AVFrame* frameRGB;
     uint8_t* buffer;
     SDL_Texture* texture;
+    // 删除这里的方法定义，因为已经移到public部分
 };
 
 // 应用程序类
 class Application {
 public:
     Application() : m_running(false), m_window(nullptr), m_renderer(nullptr), 
-                   m_videoLoaded(false), m_isPlaying(false), m_frameDelay(33) {}
+                   m_videoLoaded(false), m_isPlaying(false), m_frameDelay(33),
+                   m_currentTime(0.0), m_timelineDragging(false) {}
     ~Application() {
         cleanup();
     }
@@ -331,6 +403,85 @@ public:
         return 0;
     }
 
+// 将drawTimeline方法添加到Application类内部
+void drawTimeline(const SDL_Rect& timelineRect) {
+    // 绘制时间线背景
+    SDL_Rect timelineBarRect = { 
+        timelineRect.x + 10, 
+        timelineRect.y + 20, 
+        timelineRect.w - 20, 
+        30 
+    };
+    SDL_SetRenderDrawColor(m_renderer, 30, 30, 30, 255);
+    SDL_RenderFillRect(m_renderer, &timelineBarRect);
+    SDL_SetRenderDrawColor(m_renderer, 80, 80, 80, 255);
+    SDL_RenderDrawRect(m_renderer, &timelineBarRect);
+    
+    // 绘制时间刻度
+    double duration = m_videoDecoder.getDuration();
+    if (duration > 0) {
+        // 每10秒绘制一个刻度
+        int numTicks = (int)(duration / 10) + 1;
+        for (int i = 0; i <= numTicks; i++) {
+            double time = i * 10.0;
+            if (time > duration) time = duration;
+            
+            double ratio = time / duration;
+            int tickX = timelineBarRect.x + (int)(ratio * timelineBarRect.w);
+            
+            // 绘制刻度线
+            SDL_SetRenderDrawColor(m_renderer, 150, 150, 150, 255);
+            SDL_RenderDrawLine(
+                m_renderer,
+                tickX, timelineBarRect.y,
+                tickX, timelineBarRect.y + timelineBarRect.h
+            );
+            
+            // 绘制时间标签（简化为小矩形）
+            SDL_Rect tickRect = { tickX - 2, timelineBarRect.y + timelineBarRect.h + 5, 4, 10 };
+            SDL_RenderFillRect(m_renderer, &tickRect);
+        }
+        
+        // 绘制当前时间指示器
+        double ratio = m_currentTime / duration;
+        int currentX = timelineBarRect.x + (int)(ratio * timelineBarRect.w);
+        
+        // 绘制指示线
+        SDL_SetRenderDrawColor(m_renderer, 255, 0, 0, 255);
+        SDL_RenderDrawLine(
+            m_renderer,
+            currentX, timelineBarRect.y - 10,
+            currentX, timelineBarRect.y + timelineBarRect.h + 10
+        );
+        
+        // 绘制指示器头部
+        SDL_Rect indicatorHead = { currentX - 5, timelineBarRect.y - 15, 10, 10 };
+        SDL_RenderFillRect(m_renderer, &indicatorHead);
+        
+        // 显示当前时间/总时间
+        char timeText[50];
+        int minutes = (int)m_currentTime / 60;
+        int seconds = (int)m_currentTime % 60;
+        int totalMinutes = (int)duration / 60;
+        int totalSeconds = (int)duration % 60;
+        
+        // 在时间线下方显示时间信息
+        SDL_Rect timeInfoRect = { 
+            timelineBarRect.x, 
+            timelineBarRect.y + timelineBarRect.h + 20, 
+            100, 
+            20 
+        };
+        SDL_SetRenderDrawColor(m_renderer, 60, 60, 60, 255);
+        SDL_RenderFillRect(m_renderer, &timeInfoRect);
+        
+        // 显示进度
+        int progressWidth = (int)(ratio * timeInfoRect.w);
+        SDL_Rect progressRect = { timeInfoRect.x, timeInfoRect.y, progressWidth, timeInfoRect.h };
+        SDL_SetRenderDrawColor(m_renderer, 100, 100, 255, 255);
+        SDL_RenderFillRect(m_renderer, &progressRect);
+    }
+}
     bool loadVideo(const std::string& filename) {
         if (m_videoDecoder.openFile(filename, m_renderer)) {
             m_videoLoaded = true;
@@ -353,10 +504,17 @@ private:
                 char* droppedFile = event.drop.file;
                 loadVideo(droppedFile);
                 SDL_free(droppedFile);
+            } else if (event.type == SDL_MOUSEBUTTONDOWN) {
+                handleMouseButtonDown(event);
+            } else if (event.type == SDL_MOUSEBUTTONUP) {
+                handleMouseButtonUp(event);
+            } else if (event.type == SDL_MOUSEMOTION) {
+                handleMouseMotion(event);
             }
         }
     }
 
+    // 添加handleKeyDown方法
     void handleKeyDown(SDL_Keycode key) {
         switch (key) {
             case SDLK_ESCAPE:
@@ -375,6 +533,7 @@ private:
         }
     }
 
+    // 添加openFileDialog方法
     void openFileDialog() {
         // 在实际应用中，这里应该打开一个文件对话框
         // 由于SDL没有内置的文件对话框，这里简化为直接加载一个固定的文件
@@ -384,13 +543,82 @@ private:
         loadVideo(filename);
     }
 
+    void handleMouseButtonDown(const SDL_Event& event) {
+        if (event.button.button == SDL_BUTTON_LEFT) {
+            int mouseX = event.button.x;
+            int mouseY = event.button.y;
+            
+            // 检查是否点击在时间线上
+            int windowWidth, windowHeight;
+            SDL_GetWindowSize(m_window, &windowWidth, &windowHeight);
+            
+            SDL_Rect timelineRect = { 0, windowHeight / 2, windowWidth * 3 / 4, windowHeight / 2 };
+            SDL_Rect timelineBarRect = { 
+                timelineRect.x + 10, 
+                timelineRect.y + 20, 
+                timelineRect.w - 20, 
+                30 
+            };
+            
+            if (mouseX >= timelineBarRect.x && mouseX <= timelineBarRect.x + timelineBarRect.w &&
+                mouseY >= timelineBarRect.y && mouseY <= timelineBarRect.y + timelineBarRect.h) {
+                m_timelineDragging = true;
+                updateTimelinePosition(mouseX, timelineBarRect);
+            }
+        }
+    }
+
+    void handleMouseButtonUp(const SDL_Event& event) {
+        if (event.button.button == SDL_BUTTON_LEFT) {
+            m_timelineDragging = false;
+        }
+    }
+
+    void handleMouseMotion(const SDL_Event& event) {
+        if (m_timelineDragging) {
+            int mouseX = event.motion.x;
+            
+            int windowWidth, windowHeight;
+            SDL_GetWindowSize(m_window, &windowWidth, &windowHeight);
+            
+            SDL_Rect timelineRect = { 0, windowHeight / 2, windowWidth * 3 / 4, windowHeight / 2 };
+            SDL_Rect timelineBarRect = { 
+                timelineRect.x + 10, 
+                timelineRect.y + 20, 
+                timelineRect.w - 20, 
+                30 
+            };
+            
+            updateTimelinePosition(mouseX, timelineBarRect);
+        }
+    }
+
+    void updateTimelinePosition(int mouseX, const SDL_Rect& timelineBarRect) {
+        if (!m_videoLoaded) return;
+        
+        // 计算新的时间位置
+        double ratio = (double)(mouseX - timelineBarRect.x) / timelineBarRect.w;
+        if (ratio < 0.0) ratio = 0.0;
+        if (ratio > 1.0) ratio = 1.0;
+        
+        double duration = m_videoDecoder.getDuration();
+        double newTime = ratio * duration;
+        
+        // 跳转到新时间
+        m_videoDecoder.seekToTime(newTime);
+        m_currentTime = newTime;
+    }
+
     void update() {
         // 更新应用程序状态
-        if (m_videoLoaded && m_isPlaying) {
+        if (m_videoLoaded && m_isPlaying && !m_timelineDragging) {
             // 读取下一帧
             if (!m_videoDecoder.readFrame()) {
                 // 视频结束，重新开始
                 m_isPlaying = false;
+            } else {
+                // 更新当前时间
+                m_currentTime = m_videoDecoder.getCurrentTime();
             }
         }
     }
@@ -407,6 +635,7 @@ private:
         SDL_RenderPresent(m_renderer);
     }
 
+    // 将drawTimeline方法添加到Application类内部
     void drawUILayout() {
         int windowWidth, windowHeight;
         SDL_GetWindowSize(m_window, &windowWidth, &windowHeight);
@@ -451,6 +680,12 @@ private:
         SDL_Rect timelineRect = { 0, windowHeight / 2, windowWidth * 3 / 4, windowHeight / 2 };
         SDL_SetRenderDrawColor(m_renderer, 50, 50, 50, 255);
         SDL_RenderFillRect(m_renderer, &timelineRect);
+        
+        // 添加时间轴绘制代码
+        if (m_videoLoaded) {
+            drawTimeline(timelineRect);
+        }
+        
         SDL_SetRenderDrawColor(m_renderer, 100, 100, 100, 255);
         SDL_RenderDrawRect(m_renderer, &timelineRect);
 
@@ -490,6 +725,8 @@ private:
     bool m_videoLoaded;
     bool m_isPlaying;
     int m_frameDelay; // 毫秒
+    double m_currentTime; // 当前播放时间（秒）
+    bool m_timelineDragging; // 是否正在拖动时间线
 };
 
 int main(int argc, char* argv[]) {
@@ -507,3 +744,5 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 }
+
+
